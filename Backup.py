@@ -13,15 +13,32 @@ from basecrm.client import Client # Ensure Client is imported if not already glo
 # ----------------------------------------------------------------
 CONFIG_FILE = "parameters.config"
 
-def load_config():
-    """Load configuration from parameters.config."""
-    config = configparser.ConfigParser()
-    if not os.path.exists(CONFIG_FILE):
-        # Use st.exception for better error display in Streamlit >= 1.30
-        st.exception(FileNotFoundError(f"Configuration file '{CONFIG_FILE}' not found."))
-        st.stop()
-    config.read(CONFIG_FILE)
-    return config
+def load_api_keys():
+    """Load API keys from environment variables (Heroku) or config file (local)."""
+    monday_key = os.environ.get("MONDAY_API_KEY")
+    zendesk_key = os.environ.get("ZENDESK_API_KEY")
+
+    if monday_key and zendesk_key:
+        print("Found API keys in environment variables (Heroku mode).")
+        return monday_key, zendesk_key
+    else:
+        print("API keys not found in environment variables. Attempting to load from config file.")
+        config = configparser.ConfigParser()
+        if not os.path.exists(CONFIG_FILE):
+            st.error(f"Configuration file '{CONFIG_FILE}' not found and API keys not in environment variables.")
+            st.stop()
+        config.read(CONFIG_FILE)
+        try:
+            monday_key_conf = config.get("monday", "api_key").strip().strip('"')
+            zendesk_key_conf = config.get("zendesk", "api_key").strip().strip('"')
+            if not monday_key_conf or not zendesk_key_conf:
+                 st.error(f"API keys missing or empty in {CONFIG_FILE}.")
+                 st.stop()
+            print(f"Loaded API keys from {CONFIG_FILE}.")
+            return monday_key_conf, zendesk_key_conf
+        except (configparser.NoSectionError, configparser.NoOptionError) as e:
+            st.error(f"Could not find required section or key in {CONFIG_FILE}: {e}")
+            st.stop()
 
 # Define Monday API URL globally as it's truly constant
 MONDAY_API_URL = "https://api.monday.com/v2"
@@ -48,6 +65,8 @@ if "success_message" not in st.session_state:
      st.session_state["success_message"] = None # For success messages
 if "processing" not in st.session_state:
     st.session_state["processing"] = False # Add processing flag
+if "owner_email" not in st.session_state:
+     st.session_state["owner_email"] = None
 
 
 # ----------------------------------------------------------------
@@ -407,23 +426,10 @@ PRODUCT_ORDER_PRIORITY["Nik Collection"] = 2 # Handle full name too
 # Main App Execution Starts Here
 # ----------------------------------------------------------------
 
-# --- Load Config and API Keys ---
-config = load_config()
-try:
-    monday_api_key = config.get("monday", "api_key").strip().strip('"')
-    if not monday_api_key:
-        st.error("Monday.com API key missing/empty in parameters.config")
-        st.stop()
-
-    # Load Zendesk API key
-    zendesk_api_key = config.get("zendesk", "api_key").strip().strip('"')
-    if not zendesk_api_key:
-         st.error("Zendesk Sell API key missing/empty in parameters.config under [zendesk]")
-         st.stop()
-
-except (configparser.NoSectionError, configparser.NoOptionError) as e:
-    st.error(f"Could not find required section or key in parameters.config: {e}")
-    st.stop()
+# --- Load API Keys using the new function --- 
+# config = load_config() # Remove old config loading
+monday_api_key, zendesk_api_key = load_api_keys() # Use new function
+# --- End Load API Keys --- 
 
 # --- Define Column IDs and Status Labels ---
 PERSON_COLUMN_ID = "person" # Confirmed Person column ID
@@ -919,7 +925,7 @@ if st.session_state.get("show_error") and st.session_state.current_step != 3: # 
 # ----------------------------------------------------------------
 
 # --- Main Processing Function ---
-def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_key):
+def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_key, owner_email, monday_user_id_to_assign):
     """
     Fetches codes and links, writes formatted Zendesk note, and attempts to update Monday status.
     Returns: (bool: overall_success, str: message)
@@ -934,30 +940,18 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
     monday_person_successes = 0
     monday_person_failures = 0
     monday_person_error_msgs = []
-    owner_email = None
-    owner_warning = None
-    monday_user_id_to_assign = None
     zendesk_success = False # Initialize zendesk flag
+    note_tag_success = False # Flag for note tagging success
+    note_tag_error_msg = None # Error message for note tagging
+    owner_warning = None # Define owner_warning
 
     print(f"Processing request for Deal ID: {deal_id}, Groups: {group_ids}")
 
-    # --- NEW: Fetch Owner Email Early ---
-    print("Fetching Zendesk Deal Owner details...")
-    owner_email, owner_error = get_zendesk_deal_owner_email(deal_id, z_api_key)
-    if owner_error:
-        return False, owner_error
-    if not owner_email:
-        return False, f"Could not retrieve owner email for Zendesk Deal {deal_id}."
-    print(f"Proceeding with Owner Email: {owner_email}")
-    # --- END NEW ---
-
-    # --- Look up Monday User ID ---
-    monday_user_id_to_assign = ZENDESK_OWNER_EMAIL_TO_MONDAY_ID.get(owner_email)
-    if not monday_user_id_to_assign:
-        owner_warning = f"Warning: Owner email '{owner_email}' not found in ZENDESK_OWNER_EMAIL_TO_MONDAY_ID map. Person column will not be updated."
-        print(owner_warning)
-    else:
-        print(f"Found Monday User ID {monday_user_id_to_assign} for owner email {owner_email}")
+    # Use passed monday_user_id_to_assign (can be None)
+    if not monday_user_id_to_assign and owner_email: # Check owner_email for warning context
+         owner_warning = f"Warning: Owner email '{owner_email}' not found in map. Person column will not be updated."
+         print(owner_warning)
+    # else: owner_warning remains None
 
     # 1. Find codes and links for each group
     for group_id in group_ids:
@@ -970,12 +964,13 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
 
         headers = {"Authorization": m_api_key, "Content-Type": "application/json", "API-Version": "2023-10"}
         
-        # --- Restore Full Query using Variables ---
+        # --- MODIFIED Query with Pagination ---
         query = """
-        query GetGroupItems($boardId: ID!, $groupId: String!, $columnIds: [String!]!) {
+        query GetGroupItems($boardId: ID!, $groupId: String!, $columnIds: [String!]!, $cursor: String) {
           boards(ids: [$boardId]) {
             groups(ids: [$groupId]) {
-              items_page(limit: 500) { # Restore limit
+              items_page(limit: 100, cursor: $cursor) { # Use limit 100 per page and cursor
+                cursor # Request the cursor for the next page
                 items {
                   id
                   name
@@ -990,44 +985,84 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
           }
         }
         """
-        variables = {
+        # Initial variables (cursor will be added in the loop)
+        base_variables = {
             "boardId": str(BOARD_ID), 
             "groupId": group_id,
-            # Use the defined constants - user needs to verify these IDs
-            "columnIds": [STATUS_COLUMN_ID, MAC_LINK_COLUMN_ID, WIN_LINK_COLUMN_ID] 
+            "columnIds": [STATUS_COLUMN_ID, MAC_LINK_COLUMN_ID, WIN_LINK_COLUMN_ID]
         }
-        # --- End Restored Query ---
-        payload_dict = {"query": query, "variables": variables}
+        # --- End MODIFIED Query ---
         
         # --- Remove Detailed Logging (optional, keep if needed) ---
-        # print("-" * 20)
-        # print(f"DEBUG: Preparing request for group_id: {group_id}")
-        # print(f"DEBUG: URL: {MONDAY_API_URL}")
-        # masked_key = headers.get("Authorization", "NotSet")
-        # if len(masked_key) > 10:
-        #      masked_key = masked_key[:5] + "..." + masked_key[-5:]
-        # print(f"DEBUG: Headers: {{...}}")
-        # print(f"DEBUG: Payload Dict: {payload_dict}")
-        # print("-" * 20)
+        # ... (logging code removed for brevity)
         # --- End Removed Logging ---
 
+        all_items_in_group = [] # List to hold all items from pagination
+        current_cursor = None   # Start with no cursor
+        page_num = 1
+
         try:
-            response = requests.post(MONDAY_API_URL, headers=headers, json=payload_dict, timeout=15)
-            response.raise_for_status()
-            result = response.json()
+            print(f"DEBUG: Group {group_title}: Starting pagination...")
+            while True:
+                variables = base_variables.copy() # Copy base variables for this request
+                if current_cursor:
+                     variables["cursor"] = current_cursor # Add cursor if we have one
+                
+                payload_dict = {"query": query, "variables": variables}
 
-            if "errors" in result:
-                 raise Exception(f"Monday API Error fetching items for group {group_id}: {result['errors']}")
+                response = requests.post(MONDAY_API_URL, headers=headers, json=payload_dict, timeout=20) # Increased timeout slightly
+                response.raise_for_status()
+                result = response.json()
 
-            # --- Restore Item Processing Logic --- 
-            items = []
-            if result.get("data", {}).get("boards", []) and result["data"]["boards"][0].get("groups", []):
-                 group_data = result["data"]["boards"][0]["groups"][0]
-                 if group_data and group_data.get("items_page"):
-                      items = group_data["items_page"].get("items", [])
+                if "errors" in result:
+                     raise Exception(f"Monday API Error on page {page_num} for group {group_id}: {result['errors']}")
+
+                # Safely extract items and cursor
+                items_page_data = None
+                new_items = []
+                next_cursor = None
+                if result.get("data", {}).get("boards", []) and result["data"]["boards"][0].get("groups", []):
+                     group_data = result["data"]["boards"][0]["groups"][0]
+                     if group_data and group_data.get("items_page"):
+                          items_page_data = group_data["items_page"]
+                          new_items = items_page_data.get("items", [])
+                          next_cursor = items_page_data.get("cursor") # Get the cursor for the *next* page
+                
+                if new_items:
+                     all_items_in_group.extend(new_items)
+                     print(f"DEBUG: Group {group_title}: Fetched {len(new_items)} items on page {page_num}. Total: {len(all_items_in_group)}.")
+                else:
+                     print(f"DEBUG: Group {group_title}: No items found on page {page_num}.")
+
+                if not next_cursor: # If cursor is null or missing, we're done
+                    print(f"DEBUG: Group {group_title}: No more pages (cursor is null). Fetched {len(all_items_in_group)} items in total.")
+                    break 
+                
+                current_cursor = next_cursor
+                page_num += 1
+                time.sleep(0.2) # Small delay between pages to be kind to the API
+
+            # --- Use all_items_in_group for processing --- 
+            items = all_items_in_group # Assign the full list to the 'items' variable used below
+
+            # --- Existing Debugging (Now uses the full list) --- #
+            print(f"DEBUG: Group {group_title}: Total fetched items after pagination: {len(items)}.")
+            if items:
+                 try:
+                     newest_item = items[-1] # Still check the last item (newest overall)
+                     status_text = "Status Column Not Found"
+                     for cv in newest_item.get('column_values', []):
+                         if cv.get('id') == STATUS_COLUMN_ID:
+                             status_text = cv.get('text', 'Status Text Missing')
+                             break
+                     print(f"DEBUG: Group {group_title}: Newest item raw status text: '{status_text}' (Item ID: {newest_item.get('id')})")
+                 except Exception as e_debug:
+                     print(f"DEBUG: Group {group_title}: Error inspecting newest item: {e_debug}")
+            # --- END Debugging --- #
 
             found_in_group = False
-            for item in reversed(items):
+            # Now iterate over the *full* list fetched via pagination
+            for item in reversed(items): 
                 item_id = item["id"]
                 activation_code = item["name"]
                 status_val = None
@@ -1119,16 +1154,64 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
     # 3. Attempt to write note to Zendesk
     print("Attempting to write note to Zendesk...")
     zendesk_note_content = "Activation Codes\n\n" + "\n\n-----------\n\n".join(note_messages)
+    new_note_id = None # Initialize note ID variable
 
     try:
         z_client = Client(access_token=z_api_key)
-        z_client.notes.create({
+        # Create note WITHOUT tags initially via the library
+        create_response = z_client.notes.create({
             "resource_type": "deal",
             "resource_id": int(deal_id),
             "content": zendesk_note_content
+            # Removed "tags" parameter here
         })
-        print(f"Successfully added note to Zendesk Deal ID {deal_id}")
+        print(f"Successfully created note for Zendesk Deal ID {deal_id}.")
         zendesk_success = True
+        
+        # --- Attempt to UPDATE the note with the tag via DIRECT API CALL --- 
+        if zendesk_success and create_response and create_response.get('id'):
+             new_note_id = create_response['id']
+             target_tag = "LICENCE"
+             print(f"Attempting to tag note ID {new_note_id} with '{target_tag}' via direct API call...")
+             try:
+                 note_update_url = f"https://api.getbase.com/v2/notes/{new_note_id}"
+                 headers = {
+                     "Authorization": f"Bearer {z_api_key}",
+                     "Content-Type": "application/json",
+                     "Accept": "application/json"
+                 }
+                 payload = {
+                     "data": {
+                         "tags": [target_tag]
+                     }
+                 }
+                 update_response = requests.put(note_update_url, json=payload, headers=headers, timeout=10)
+                 
+                 # Check status code for success (e.g., 200 OK)
+                 if update_response.status_code == 200:
+                     print(f"Successfully tagged note ID {new_note_id} via direct API call (Status: {update_response.status_code}).")
+                     note_tag_success = True
+                 else:
+                     # Log error details if possible
+                     error_details = ""
+                     try:
+                          error_details = update_response.json() # Try to get JSON error body
+                     except json.JSONDecodeError:
+                          error_details = update_response.text # Fallback to raw text
+                     note_tag_error_msg = f"Failed to tag note {new_note_id} via direct API call. Status: {update_response.status_code}, Response: {error_details}"
+                     print(f"Error: {note_tag_error_msg}")
+
+             except requests.exceptions.RequestException as e_req:
+                 note_tag_error_msg = f"Network error while trying to tag note {new_note_id} via direct API call: {e_req}"
+                 print(f"Error: {note_tag_error_msg}")
+             except Exception as e_update:
+                 note_tag_error_msg = f"Unexpected error while trying to tag note {new_note_id} via direct API call: {e_update}"
+                 print(f"Error: {note_tag_error_msg}")
+        elif zendesk_success:
+             note_tag_error_msg = "Note created, but could not get Note ID from response to update tags."
+             print(f"Warning: {note_tag_error_msg}")
+        # --- End Note Update Attempt --- 
+
     except Exception as e:
         zendesk_error_msg = f"Failed to write note to Zendesk Deal ID {deal_id}: {e}"
         print(f"Error: {zendesk_error_msg}")
@@ -1187,47 +1270,56 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
                 print(f"Failed to update status for item {item_id}: {update_msg}")
                 # Don't attempt to assign person if status update failed
 
-        # --- Construct Final Message (Modified) ---
+        # --- FIX: Format Final Message as HTML List --- 
         success_parts = []
         failure_parts = []
-        final_overall_success = True # Assume success unless status update fails
+        final_overall_success = True
 
-        success_parts.append(f"Added note to Zendesk Deal {deal_id}")
-
-        if monday_update_failures == 0:
-             success_parts.append(f"updated status for {monday_update_successes} item(s) on Monday.com")
+        # Build success parts list (based on successful actions)
+        if zendesk_success: # Check if note creation succeeded
+             success_parts.append(f"Added note to Zendesk Deal {deal_id}")
+             # Add note tag status 
+             if note_tag_success:
+                 success_parts.append(f"Tagged note with 'LICENCE'")
         else:
+             # If note creation failed, the whole process failed earlier
+             final_overall_success = False
+
+        if monday_update_successes > 0:
+             success_parts.append(f"Updated status to '{target_status_label}' for {monday_update_successes} item(s) on Monday.com")
+        if monday_person_successes > 0:
+             owner_display = owner_email if owner_email else "(Unknown Email)" 
+             success_parts.append(f"Assigned owner ({owner_display}) for {monday_person_successes} item(s)")
+
+        # Build failure/warning parts list
+        if note_tag_error_msg: # Add note tag error if present
+             failure_parts.append(note_tag_error_msg)
+             # Decide if note tagging failure should mark overall process as failed
+             # final_overall_success = False 
+        if monday_update_failures > 0:
              failure_parts.append(f"failed to update status for {monday_update_failures}/{len(items_found_details)} item(s)")
              if monday_update_error_msgs: failure_parts.append(f"(Status Errors: {'; '.join(monday_update_error_msgs)})" )
-             final_overall_success = False # Status update failure makes overall process fail
+        if owner_warning:
+             failure_parts.append(owner_warning.replace("Warning: ", "")) # Remove prefix for display
 
-        # Check person assignment outcome only if mapping existed
-        if monday_user_id_to_assign:
-            if monday_person_failures == 0:
-                 # Only report success if we actually assigned (person_successes > 0 implies items_found_details > 0)
-                 if monday_person_successes > 0:
-                     success_parts.append(f"assigned owner for {monday_person_successes} item(s)")
-            else:
-                 failure_parts.append(f"failed to assign owner for {monday_person_failures}/{len(items_found_details)} item(s)")
-                 if monday_person_error_msgs: failure_parts.append(f"(Owner Assign Errors: {'; '.join(monday_person_error_msgs)})" )
-                 # Optional: Decide if person failure makes overall process fail. Let's say no for now.
-                 # final_overall_success = False 
-        elif owner_warning: # Add the warning if no mapping existed
-             # Append warning to failure parts for visibility, but don't mark process as failed
-             failure_parts.append("(Owner not assigned: owner email not mapped)") 
-
-
-        # Build final message string
-        final_message = "Process Summary: " # Add a prefix
-        final_message += " & ".join(success_parts) + "." # Use '&' for brevity
+        # Construct the HTML list message
+        final_message = "<b>Process Summary:</b><ul>" 
+        for part in success_parts:
+            final_message += f"<li>✅ {part}</li>"
+        final_message += "</ul>" 
+        
         if failure_parts:
-             final_message += " However, " + " and ".join(failure_parts).strip() + "."
+            final_message += "<br><b>Notes / Issues:</b><ul>"
+            for part in failure_parts:
+                 prefix = "❌" if "failed" in part else "⚠️" 
+                 final_message += f"<li>{prefix} {part}</li>"
+            final_message += "</ul>" 
+        # --- End FIX ---
 
         print(f"Final Outcome: Success={final_overall_success}, Message={final_message}")
         return final_overall_success, final_message
-        # --- End Modified Final Message ---
 
-    return False, global_error or zendesk_error_msg or "An unknown error occurred before Monday update attempt."
+    return False, global_error or zendesk_error_msg
 
 # --- Step 1: Enter Deal ID ---
 if st.session_state["current_step"] == 1:
@@ -1248,33 +1340,53 @@ if st.session_state["current_step"] == 1:
                 st.rerun()
             else:
                 st.session_state["deal_id"] = deal_id
-                with st.spinner("Fetching groups from Monday.com..."):
-                    fetched_groups, error_msg = fetch_monday_data(
-                        deal_id,
-                        BOARD_ID,
-                        MONDAY_API_URL,
-                        monday_api_key
-                    )
-                if error_msg and fetched_groups is None:
-                    st.session_state["show_error"] = error_msg
-                    st.session_state["all_groups"] = []
-                    st.rerun()
+                owner_email = None
+                owner_error = None
+
+                # --- Fetch Owner Info Here ---
+                with st.spinner("Fetching deal owner info from Zendesk..."):
+                    # Assume zendesk_api_key is loaded globally or passed appropriately
+                    owner_email, owner_error = get_zendesk_deal_owner_email(deal_id, zendesk_api_key)
+
+                if owner_error:
+                     st.session_state["show_error"] = owner_error
+                     st.rerun() # Show error and stay on Step 1
+                elif not owner_email:
+                     st.session_state["show_error"] = f"Could not retrieve owner email for Zendesk Deal {deal_id}."
+                     st.rerun() # Show error and stay on Step 1
                 else:
-                    st.session_state["all_groups"] = fetched_groups if fetched_groups is not None else []
-                    st.session_state["selected_groups"] = [] # Start with empty selection now
-                    st.session_state["current_step"] = 2
-                    st.session_state["show_error"] = error_msg 
-                    st.rerun()
+                     st.session_state["owner_email"] = owner_email
+                     print(f"Fetched owner email: {owner_email}")
+                # --- End Fetch Owner Info ---
+
+                # --- Fetch Monday Groups (only if owner fetch succeeded) ---
+                with st.spinner("Fetching groups from Monday.com..."):
+                    # Assume monday_api_key is loaded globally or passed appropriately
+                    fetched_groups, error_msg = fetch_monday_data(
+                        deal_id, BOARD_ID, MONDAY_API_URL, monday_api_key
+                    )
+                
+                if error_msg and fetched_groups is None:
+                     st.session_state["show_error"] = error_msg
+                     st.rerun()
+                else:
+                     st.session_state["all_groups"] = fetched_groups if fetched_groups is not None else []
+                     st.session_state["selected_groups"] = []
+                     st.session_state["current_step"] = 2
+                     st.session_state["show_error"] = error_msg 
+                     st.rerun()
 
 
 # --- Step 2: Select Product ---
 elif st.session_state["current_step"] == 2:
     deal_id = st.session_state.get("deal_id", "N/A")
+    owner_email = st.session_state.get("owner_email", "Unknown Owner") # Get owner from state
     all_groups = st.session_state.get("all_groups", [])
-    # Ensure selected_titles is initialized correctly
-    selected_titles = st.session_state.get("selected_groups", [])
+    selected_titles = st.session_state.get("selected_groups", []) # Use state
 
-    st.markdown(f'<div class="info-box">Select the products for Deal ID <strong>{deal_id}</strong>.</div>', unsafe_allow_html=True)
+    # --- Display Owner in Info Box ---
+    st.markdown(f'<div class="info-box">Select the products for Deal ID <strong>{deal_id}</strong> (Owned by: <strong>{owner_email}</strong>).</div>', unsafe_allow_html=True)
+    # --- End Display Owner ---
     st.markdown("---")
     st.subheader("Available Products:")
     st.markdown("Please select the product(s) you need:")
@@ -1282,124 +1394,109 @@ elif st.session_state["current_step"] == 2:
     if not all_groups:
         st.warning("No product groups were found on the Monday.com board.")
     else:
-        # Need to reconstruct selected_titles based on current checkbox state before rendering buttons
         current_selection = []
         for group in all_groups:
             group_id = group["id"]
             group_title = group["title"]
             checkbox_key = f"group_checkbox_{group_id}"
             mapped_name = get_product_display_name(group_title)
-            if mapped_name != group_title:
-                display_label = f"{group_title} ({mapped_name})"
-            else:
-                display_label = group_title
+            display_label = f"{group_title} ({mapped_name})" if mapped_name != group_title else group_title
             col1, col2 = st.columns([10, 1])
             with col1:
-                st.markdown(f'{display_label}', unsafe_allow_html=True) 
+                st.markdown(f'{display_label}', unsafe_allow_html=True)
             with col2:
                  is_checked = st.checkbox(
-                     label="\u00A0", 
-                     value=st.session_state.get(checkbox_key, False), # Read state if exists, default False
+                     label="\u00A0",
+                     value=st.session_state.get(checkbox_key, False), 
                      key=checkbox_key,
                      label_visibility='collapsed'
                  )
             if is_checked:
                 current_selection.append(group_title)
-        # Update session state based on current UI state
         st.session_state.selected_groups = current_selection
-        # Now use the updated state for button logic
-        selected_titles = st.session_state.selected_groups 
-            
+        selected_titles = st.session_state.selected_groups
+
         st.markdown(" ")
         st.markdown(f"**Selected {len(selected_titles)} out of {len(all_groups)} products.**")
         st.markdown("---")
 
-    # --- Render Buttons with Disabled State ---
+    # --- Buttons --- 
     proceed_disabled_logic = len(selected_titles) == 0 or st.session_state.processing
     back_disabled_logic = st.session_state.processing
 
     if st.button("Proceed with Selected Products", disabled=proceed_disabled_logic):
-        # --- Set processing flag and rerun to disable buttons --- 
         st.session_state.processing = True
-        # Store current selections needed for processing *before* rerun
         st.session_state._current_selection_ids = [g["id"] for g in all_groups if g["title"] in selected_titles]
         st.session_state._current_selection_map = {g["id"]: g["title"] for g in all_groups if g["title"] in selected_titles}
-        st.rerun() # Rerun immediately to show disabled buttons and spinner
+        st.rerun() 
 
-    # --- Processing logic runs AFTER the rerun if processing was set --- 
     if st.session_state.processing:
-        # Use selections stored before the rerun
-        selected_group_ids = st.session_state.get("_current_selection_ids", [])
-        selected_group_map = st.session_state.get("_current_selection_map", {})
-        current_deal_id = st.session_state.deal_id # Already in state
+         selected_group_ids = st.session_state.get("_current_selection_ids", [])
+         selected_group_map = st.session_state.get("_current_selection_map", {})
+         current_deal_id = st.session_state.deal_id
+         current_owner_email = st.session_state.owner_email 
+         
+         # Lookup monday id *before* calling process function
+         monday_user_id = ZENDESK_OWNER_EMAIL_TO_MONDAY_ID.get(current_owner_email) 
 
-        # Clean up temporary state variables
-        if "_current_selection_ids" in st.session_state: del st.session_state._current_selection_ids
-        if "_current_selection_map" in st.session_state: del st.session_state._current_selection_map
-        
-        # --- Update Spinner Text ---
-        with st.spinner("Please wait a few seconds... Finding codes and updating CRM..."):
-        # --- End Update Spinner Text ---
-            final_success, message = process_activation_request(
-                current_deal_id,
-                selected_group_ids,
-                selected_group_map,
-                monday_api_key,
-                zendesk_api_key
-            )
+         if "_current_selection_ids" in st.session_state: del st.session_state._current_selection_ids
+         if "_current_selection_map" in st.session_state: del st.session_state._current_selection_map
+         
+         with st.spinner("Please wait a few seconds... Finding codes and updating CRM..."):
+             final_success, message = process_activation_request(
+                 current_deal_id,
+                 selected_group_ids, 
+                 selected_group_map, 
+                 monday_api_key,
+                 zendesk_api_key,
+                 current_owner_email, # Pass owner email
+                 monday_user_id      # Pass looked-up monday id (or None)
+             )
+         
+         st.session_state["note_written"] = final_success
+         st.session_state.processing = False # Reset processing flag
+         if final_success:
+             st.session_state["success_message"] = message
+             st.session_state["show_error"] = None
+             st.session_state.current_step = 3
+         else:
+             st.session_state["success_message"] = None
+             st.session_state["show_error"] = message
+         st.rerun() 
 
-        # Process result and transition
-        st.session_state["note_written"] = final_success
-        if final_success:
-            st.session_state["success_message"] = message
-            st.session_state["show_error"] = None
-            st.session_state.processing = False # Reset before moving step
-            st.session_state.current_step = 3
-        else:
-            st.session_state["success_message"] = None
-            st.session_state["show_error"] = message
-            st.session_state.processing = False # Reset on error
-
-        # Clean up checkbox states (can stay here or move fully to reset_app)
-        # for group in all_groups: # Maybe not needed here if state clears on step change
-        #     checkbox_key = f"group_checkbox_{group['id']}"
-        #     if checkbox_key in st.session_state:
-        #         del st.session_state[checkbox_key]
-        st.rerun() # Rerun to show Step 3 or error on Step 2
-
-    # Render Back button
     st.markdown('<div class="secondary-btn">', unsafe_allow_html=True)
     if st.button("Back (Enter Different ID)", disabled=back_disabled_logic):
-        st.session_state.processing = False # Ensure reset if going back
-        reset_app() # reset_app should clean checkbox keys if needed
+        st.session_state.processing = False 
+        reset_app() 
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
 
 # --- Step 3: Result ---
 elif st.session_state["current_step"] == 3:
-    # --- FIX: Structured Success Display ---
     if st.session_state.get("note_written") is True:
-        st.balloons() # Add some celebration!
+        st.balloons()
         st.markdown("### Success!")
         st.markdown("Please refresh your Zendesk deal page to see the activation code(s) in the internal notes.")
-        # Display the detailed message from the processing function
         if st.session_state.get("success_message"):
-             # Use the existing success box styling
              st.markdown(f'<div class="success-box">{st.session_state["success_message"]}</div>', unsafe_allow_html=True)
-             st.session_state["success_message"] = None # Clear after showing
+             st.session_state["success_message"] = None 
 
-    elif st.session_state.get("show_error"): # Check if error occurred instead
-         st.error(st.session_state["show_error"]) # Display error if process failed (using st.error)
-         st.session_state["show_error"] = None
+    elif st.session_state.get("show_error"):
+        error_message = st.session_state["show_error"]
+        # --- FIX: Handle 'No Codes Found' Message ---
+        no_codes_prefix = "INFO: No codes found:"
+        if error_message and error_message.startswith(no_codes_prefix):
+             # Display info message with custom styling if possible, or st.info
+             st.info(error_message.replace(no_codes_prefix, "").strip()) 
+        else:
+             st.error(error_message) # Show other errors normally
+        # --- End FIX ---
+        st.session_state["show_error"] = None 
     else:
-         # Fallback if state is somehow step 3 without success/error message
          st.warning("Processing complete, but final status unclear. Please check Zendesk and Monday.")
-    # --- End FIX ---
-
-    # Start Over button remains
+    
     if st.button("Start Over"):
-        # Clear note_written state when starting over from result page
         if 'note_written' in st.session_state: del st.session_state['note_written']
         reset_app()
         st.rerun()
