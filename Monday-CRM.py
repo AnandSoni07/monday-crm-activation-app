@@ -941,6 +941,8 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
     monday_person_failures = 0
     monday_person_error_msgs = []
     zendesk_success = False # Initialize zendesk flag
+    note_tag_success = False # Flag for note tagging success
+    note_tag_error_msg = None # Error message for note tagging
     owner_warning = None # Define owner_warning
 
     print(f"Processing request for Deal ID: {deal_id}, Groups: {group_ids}")
@@ -962,12 +964,13 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
 
         headers = {"Authorization": m_api_key, "Content-Type": "application/json", "API-Version": "2023-10"}
         
-        # --- Restore Full Query using Variables ---
+        # --- MODIFIED Query with Pagination ---
         query = """
-        query GetGroupItems($boardId: ID!, $groupId: String!, $columnIds: [String!]!) {
+        query GetGroupItems($boardId: ID!, $groupId: String!, $columnIds: [String!]!, $cursor: String) {
           boards(ids: [$boardId]) {
             groups(ids: [$groupId]) {
-              items_page(limit: 500) { # Restore limit
+              items_page(limit: 100, cursor: $cursor) { # Use limit 100 per page and cursor
+                cursor # Request the cursor for the next page
                 items {
                   id
                   name
@@ -982,44 +985,84 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
           }
         }
         """
-        variables = {
+        # Initial variables (cursor will be added in the loop)
+        base_variables = {
             "boardId": str(BOARD_ID), 
             "groupId": group_id,
-            # Use the defined constants - user needs to verify these IDs
-            "columnIds": [STATUS_COLUMN_ID, MAC_LINK_COLUMN_ID, WIN_LINK_COLUMN_ID] 
+            "columnIds": [STATUS_COLUMN_ID, MAC_LINK_COLUMN_ID, WIN_LINK_COLUMN_ID]
         }
-        # --- End Restored Query ---
-        payload_dict = {"query": query, "variables": variables}
+        # --- End MODIFIED Query ---
         
         # --- Remove Detailed Logging (optional, keep if needed) ---
-        # print("-" * 20)
-        # print(f"DEBUG: Preparing request for group_id: {group_id}")
-        # print(f"DEBUG: URL: {MONDAY_API_URL}")
-        # masked_key = headers.get("Authorization", "NotSet")
-        # if len(masked_key) > 10:
-        #      masked_key = masked_key[:5] + "..." + masked_key[-5:]
-        # print(f"DEBUG: Headers: {{...}}")
-        # print(f"DEBUG: Payload Dict: {payload_dict}")
-        # print("-" * 20)
+        # ... (logging code removed for brevity)
         # --- End Removed Logging ---
 
+        all_items_in_group = [] # List to hold all items from pagination
+        current_cursor = None   # Start with no cursor
+        page_num = 1
+
         try:
-            response = requests.post(MONDAY_API_URL, headers=headers, json=payload_dict, timeout=15)
-            response.raise_for_status()
-            result = response.json()
+            print(f"DEBUG: Group {group_title}: Starting pagination...")
+            while True:
+                variables = base_variables.copy() # Copy base variables for this request
+                if current_cursor:
+                     variables["cursor"] = current_cursor # Add cursor if we have one
+                
+                payload_dict = {"query": query, "variables": variables}
 
-            if "errors" in result:
-                 raise Exception(f"Monday API Error fetching items for group {group_id}: {result['errors']}")
+                response = requests.post(MONDAY_API_URL, headers=headers, json=payload_dict, timeout=20) # Increased timeout slightly
+                response.raise_for_status()
+                result = response.json()
 
-            # --- Restore Item Processing Logic --- 
-            items = []
-            if result.get("data", {}).get("boards", []) and result["data"]["boards"][0].get("groups", []):
-                 group_data = result["data"]["boards"][0]["groups"][0]
-                 if group_data and group_data.get("items_page"):
-                      items = group_data["items_page"].get("items", [])
+                if "errors" in result:
+                     raise Exception(f"Monday API Error on page {page_num} for group {group_id}: {result['errors']}")
+
+                # Safely extract items and cursor
+                items_page_data = None
+                new_items = []
+                next_cursor = None
+                if result.get("data", {}).get("boards", []) and result["data"]["boards"][0].get("groups", []):
+                     group_data = result["data"]["boards"][0]["groups"][0]
+                     if group_data and group_data.get("items_page"):
+                          items_page_data = group_data["items_page"]
+                          new_items = items_page_data.get("items", [])
+                          next_cursor = items_page_data.get("cursor") # Get the cursor for the *next* page
+                
+                if new_items:
+                     all_items_in_group.extend(new_items)
+                     print(f"DEBUG: Group {group_title}: Fetched {len(new_items)} items on page {page_num}. Total: {len(all_items_in_group)}.")
+                else:
+                     print(f"DEBUG: Group {group_title}: No items found on page {page_num}.")
+
+                if not next_cursor: # If cursor is null or missing, we're done
+                    print(f"DEBUG: Group {group_title}: No more pages (cursor is null). Fetched {len(all_items_in_group)} items in total.")
+                    break 
+                
+                current_cursor = next_cursor
+                page_num += 1
+                time.sleep(0.2) # Small delay between pages to be kind to the API
+
+            # --- Use all_items_in_group for processing --- 
+            items = all_items_in_group # Assign the full list to the 'items' variable used below
+
+            # --- Existing Debugging (Now uses the full list) --- #
+            print(f"DEBUG: Group {group_title}: Total fetched items after pagination: {len(items)}.")
+            if items:
+                 try:
+                     newest_item = items[-1] # Still check the last item (newest overall)
+                     status_text = "Status Column Not Found"
+                     for cv in newest_item.get('column_values', []):
+                         if cv.get('id') == STATUS_COLUMN_ID:
+                             status_text = cv.get('text', 'Status Text Missing')
+                             break
+                     print(f"DEBUG: Group {group_title}: Newest item raw status text: '{status_text}' (Item ID: {newest_item.get('id')})")
+                 except Exception as e_debug:
+                     print(f"DEBUG: Group {group_title}: Error inspecting newest item: {e_debug}")
+            # --- END Debugging --- #
 
             found_in_group = False
-            for item in reversed(items):
+            # Now iterate over the *full* list fetched via pagination
+            for item in reversed(items): 
                 item_id = item["id"]
                 activation_code = item["name"]
                 status_val = None
@@ -1111,16 +1154,64 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
     # 3. Attempt to write note to Zendesk
     print("Attempting to write note to Zendesk...")
     zendesk_note_content = "Activation Codes\n\n" + "\n\n-----------\n\n".join(note_messages)
+    new_note_id = None # Initialize note ID variable
 
     try:
         z_client = Client(access_token=z_api_key)
-        z_client.notes.create({
+        # Create note WITHOUT tags initially via the library
+        create_response = z_client.notes.create({
             "resource_type": "deal",
             "resource_id": int(deal_id),
             "content": zendesk_note_content
+            # Removed "tags" parameter here
         })
-        print(f"Successfully added note to Zendesk Deal ID {deal_id}")
+        print(f"Successfully created note for Zendesk Deal ID {deal_id}.")
         zendesk_success = True
+        
+        # --- Attempt to UPDATE the note with the tag via DIRECT API CALL --- 
+        if zendesk_success and create_response and create_response.get('id'):
+             new_note_id = create_response['id']
+             target_tag = "LICENCE"
+             print(f"Attempting to tag note ID {new_note_id} with '{target_tag}' via direct API call...")
+             try:
+                 note_update_url = f"https://api.getbase.com/v2/notes/{new_note_id}"
+                 headers = {
+                     "Authorization": f"Bearer {z_api_key}",
+                     "Content-Type": "application/json",
+                     "Accept": "application/json"
+                 }
+                 payload = {
+                     "data": {
+                         "tags": [target_tag]
+                     }
+                 }
+                 update_response = requests.put(note_update_url, json=payload, headers=headers, timeout=10)
+                 
+                 # Check status code for success (e.g., 200 OK)
+                 if update_response.status_code == 200:
+                     print(f"Successfully tagged note ID {new_note_id} via direct API call (Status: {update_response.status_code}).")
+                     note_tag_success = True
+                 else:
+                     # Log error details if possible
+                     error_details = ""
+                     try:
+                          error_details = update_response.json() # Try to get JSON error body
+                     except json.JSONDecodeError:
+                          error_details = update_response.text # Fallback to raw text
+                     note_tag_error_msg = f"Failed to tag note {new_note_id} via direct API call. Status: {update_response.status_code}, Response: {error_details}"
+                     print(f"Error: {note_tag_error_msg}")
+
+             except requests.exceptions.RequestException as e_req:
+                 note_tag_error_msg = f"Network error while trying to tag note {new_note_id} via direct API call: {e_req}"
+                 print(f"Error: {note_tag_error_msg}")
+             except Exception as e_update:
+                 note_tag_error_msg = f"Unexpected error while trying to tag note {new_note_id} via direct API call: {e_update}"
+                 print(f"Error: {note_tag_error_msg}")
+        elif zendesk_success:
+             note_tag_error_msg = "Note created, but could not get Note ID from response to update tags."
+             print(f"Warning: {note_tag_error_msg}")
+        # --- End Note Update Attempt --- 
+
     except Exception as e:
         zendesk_error_msg = f"Failed to write note to Zendesk Deal ID {deal_id}: {e}"
         print(f"Error: {zendesk_error_msg}")
@@ -1185,20 +1276,29 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
         final_overall_success = True
 
         # Build success parts list (based on successful actions)
-        success_parts.append(f"Added note to Zendesk Deal {deal_id}")
+        if zendesk_success: # Check if note creation succeeded
+             success_parts.append(f"Added note to Zendesk Deal {deal_id}")
+             # Add note tag status 
+             if note_tag_success:
+                 success_parts.append(f"Tagged note with 'LICENCE'")
+        else:
+             # If note creation failed, the whole process failed earlier
+             final_overall_success = False
+
         if monday_update_successes > 0:
-             success_parts.append(f"updated status for {monday_update_successes} item(s) on Monday.com")
+             success_parts.append(f"Updated status to '{target_status_label}' for {monday_update_successes} item(s) on Monday.com")
         if monday_person_successes > 0:
-             success_parts.append(f"assigned owner for {monday_person_successes} item(s)")
+             owner_display = owner_email if owner_email else "(Unknown Email)" 
+             success_parts.append(f"Assigned owner ({owner_display}) for {monday_person_successes} item(s)")
 
         # Build failure/warning parts list
+        if note_tag_error_msg: # Add note tag error if present
+             failure_parts.append(note_tag_error_msg)
+             # Decide if note tagging failure should mark overall process as failed
+             # final_overall_success = False 
         if monday_update_failures > 0:
              failure_parts.append(f"failed to update status for {monday_update_failures}/{len(items_found_details)} item(s)")
              if monday_update_error_msgs: failure_parts.append(f"(Status Errors: {'; '.join(monday_update_error_msgs)})" )
-             final_overall_success = False 
-        if monday_person_failures > 0:
-             failure_parts.append(f"failed to assign owner for {monday_person_failures}/{len(items_found_details)} item(s)")
-             if monday_person_error_msgs: failure_parts.append(f"(Owner Assign Errors: {'; '.join(monday_person_error_msgs)})" )
         if owner_warning:
              failure_parts.append(owner_warning.replace("Warning: ", "")) # Remove prefix for display
 
@@ -1219,7 +1319,7 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
         print(f"Final Outcome: Success={final_overall_success}, Message={final_message}")
         return final_overall_success, final_message
 
-    return False, global_error or zendesk_error_msg or "An unknown error occurred before Monday update attempt."
+    return False, global_error or zendesk_error_msg
 
 # --- Step 1: Enter Deal ID ---
 if st.session_state["current_step"] == 1:
