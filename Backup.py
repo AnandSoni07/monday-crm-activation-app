@@ -1145,10 +1145,12 @@ def process_activation_request(deal_id, group_ids, group_map, m_api_key, z_api_k
             return False, f"No '{STATUS_LABEL_NOT_USED}' activation codes found in the selected groups for Deal ID {deal_id}."
     else:
         for item_id, code, prod_name, mac_url, win_url in items_found_details:
-            note_entry = f"Product Name: {prod_name}\n"
-            note_entry += f"Activation Code: {code}\n"
-            note_entry += f"[MAC Download Link]({mac_url})\n" if mac_url != "N/A" else "MAC Download Link: N/A\n"
-            note_entry += f"[WIN Download Link]({win_url})" if win_url != "N/A" else "WIN Download Link: N/A"
+            # Format links or N/A string
+            mac_link_str = f"[MAC Download Link]({mac_url})" if mac_url != "N/A" else "MAC Download Link: N/A"
+            win_link_str = f"[WIN Download Link]({win_url})" if win_url != "N/A" else "WIN Download Link: N/A"
+
+            # Combine all parts into a single line separated by ||, with bolding
+            note_entry = f"**Product Name:** {prod_name} || Activation Code: **{code}** || {mac_link_str} || {win_link_str}"
             note_messages.append(note_entry)
 
     # 3. Attempt to write note to Zendesk
